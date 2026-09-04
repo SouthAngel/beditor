@@ -1,0 +1,47 @@
+[package]
+name = "beditor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+description = "通用大文件终端编辑器 - 文本+Hex双模式、内存比率缓存、异步加载"
+
+[[bin]]
+name = "beditor"
+path = "src/main.rs"
+
+[lib]
+name = "beditor"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+ratatui = "0.27"
+crossterm = { version = "0.27", features = ["event-stream"] }
+sysinfo = "0.30"
+memchr = "2"
+chardetng = "0.1"
+encoding_rs = "0.8"
+anyhow = "1"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+lru = "0.12"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+
+[[bench]]
+name = "gap_buffer_insert"
+harness = false
+
+[[bench]]
+name = "cache_hit"
+harness = false
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
