@@ -64,13 +64,16 @@ pub fn render(
             ])
             .split(area);
 
-        // 标题栏
+        // 标题栏（分隔符用 ASCII '|'：'│'(U+2502) 是 Ambiguous 宽度字符，
+        // 在 CJK 终端按全角 2 列渲染，会与 ratatui 的 1 列布局错位）
         let title = format!(
-            " beditor │ {} │ {} │ {} ",
+            " beditor | {} | {} | {} ",
             editor.file_path.display(),
             format_size(editor.file_size),
             editor.text_encoding.name(),
         );
+        // 清空行尾，避免标题变短（如保存后大小位数变化）时右侧残留
+        frame.render_widget(Clear, chunks[0]);
         frame.render_widget(
             Paragraph::new(title)
                 .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -134,11 +137,15 @@ pub fn render(
 
         // MiniBuffer
         let mb_line = render_mini_buffer(status);
+        // 清空行尾，避免消息从长变短时右侧残留
+        frame.render_widget(Clear, chunks[2]);
         frame.render_widget(Paragraph::new(mb_line), chunks[2]);
 
         // 状态栏
         let stats = editor.cache.stats();
         let sb_line = render_status_bar(editor, &stats, status);
+        // 清空行尾，避免数字位数/编码名长度变化时右侧残留
+        frame.render_widget(Clear, chunks[3]);
         frame.render_widget(Paragraph::new(sb_line), chunks[3]);
 
         // 定位硬件光标到编辑器光标位置（否则光标在渲染期间不可见/错位）

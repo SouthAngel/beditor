@@ -24,10 +24,10 @@ fn format_byte_ascii_printable() {
 
 #[test]
 fn format_byte_ascii_control() {
-    assert_eq!(format_byte_ascii(0), '·');
-    assert_eq!(format_byte_ascii(0x0A), '·');
-    assert_eq!(format_byte_ascii(0x1F), '·');
-    assert_eq!(format_byte_ascii(0x7F), '·');
+    assert_eq!(format_byte_ascii(0), '.');
+    assert_eq!(format_byte_ascii(0x0A), '.');
+    assert_eq!(format_byte_ascii(0x1F), '.');
+    assert_eq!(format_byte_ascii(0x7F), '.');
 }
 
 #[test]

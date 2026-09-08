@@ -12,11 +12,15 @@ pub fn format_byte_hex(byte: u8) -> String {
 }
 
 /// 格式化字节为 ASCII 字符（控制字符显示为点号）
+///
+/// 注意：必须使用纯 ASCII（'.'），不能使用 '·'(U+00B7) 等
+/// East Asian Width 为 Ambiguous 的字符——在 CJK 终端中它们按全角
+/// 2 列渲染，而 ratatui 按半角 1 列布局，会导致行内错位与翻页残留。
 pub fn format_byte_ascii(byte: u8) -> char {
     if (0x20..=0x7E).contains(&byte) {
         byte as char
     } else {
-        '·'
+        '.'
     }
 }
 
