@@ -188,6 +188,23 @@ pub async fn handle_normal_key(
             viewport.ensure_cursor_visible(editor).await;
             NormalAction::None
         }
+        // f 下翻页 / b 上翻页（与 PageDown/PageUp 等价）
+        KeyCode::Char('f') => {
+            let lines = viewport.visible_rows as i64;
+            editor.move_cursor_lines(lines, viewport.bytes_per_line(editor), &mut viewport.line_index).await;
+            viewport.scroll_page(editor, 1).await;
+            viewport.ensure_cursor_visible(editor).await;
+            NormalAction::None
+        }
+        KeyCode::Char('b') => {
+            let lines = -(viewport.visible_rows as i64);
+            editor.move_cursor_lines(lines, viewport.bytes_per_line(editor), &mut viewport.line_index).await;
+            viewport.scroll_page(editor, -1).await;
+            viewport.ensure_cursor_visible(editor).await;
+            NormalAction::None
+        }
+        // Esc 退出程序（经 try_quit：有未保存修改时提示而非直接退出）
+        KeyCode::Esc => NormalAction::Quit,
         KeyCode::Char('d') if mods.contains(KeyModifiers::CONTROL) => {
             let lines = (viewport.visible_rows / 2) as i64;
             editor.move_cursor_lines(lines, viewport.bytes_per_line(editor), &mut viewport.line_index).await;

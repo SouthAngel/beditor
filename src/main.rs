@@ -535,7 +535,7 @@ async fn handle_command_result(
             status.message_is_error = false;
         }
         CommandResult::Help => {
-            status.message = Some(":w 保存 | :q 退出 | :q! 强制退出 | :wq 保存退出 | :goto <offset> | :mode text/hex | :enc <name> | i 插入 | u 撤销 | Ctrl+R 重做".into());
+            status.message = Some(":w 保存 | :q 退出 | :q! 强制退出 | :wq 保存退出 | :goto <offset> | :mode text/hex | :enc <name> | i 插入 | u 撤销 | Ctrl+R 重做 | f 下页 | b 上页 | Esc 退出".into());
             status.message_is_error = false;
         }
         CommandResult::Unknown(s) => {
