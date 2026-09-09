@@ -19,7 +19,7 @@ fn tmp_wal_path(tmp: &tempfile::TempDir) -> std::path::PathBuf {
 #[test]
 fn wal_append_get_reset() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let wal = Wal::open(tmp_wal_path(&tmp)).unwrap();
+    let wal = Wal::open(tmp_wal_path(&tmp), true).unwrap().unwrap();
     assert!(!wal.has_entries());
     wal.append_many(&[(0, b"hello".to_vec()), (1, b"world".to_vec())]).unwrap();
     assert!(wal.has_entries());
@@ -33,9 +33,18 @@ fn wal_append_get_reset() {
 }
 
 #[test]
+fn wal_open_nonexistent_create_false() {
+    // create=false 且文件不存在 → Ok(None)，不生成临时文件
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp_wal_path(&tmp);
+    assert!(Wal::open(path.clone(), false).unwrap().is_none());
+    assert!(!path.exists(), "create=false 不应创建文件");
+}
+
+#[test]
 fn wal_same_block_latest_wins() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let wal = Wal::open(tmp_wal_path(&tmp)).unwrap();
+    let wal = Wal::open(tmp_wal_path(&tmp), true).unwrap().unwrap();
     wal.append_one(0, b"v1").unwrap();
     wal.append_one(0, b"v2-longer").unwrap();
     assert_eq!(wal.get(0).unwrap(), Some(b"v2-longer".to_vec()));
@@ -45,10 +54,10 @@ fn wal_same_block_latest_wins() {
 fn wal_replay_after_reopen() {
     let tmp = tempfile::TempDir::new().unwrap();
     {
-        let wal = Wal::open(tmp_wal_path(&tmp)).unwrap();
+        let wal = Wal::open(tmp_wal_path(&tmp), true).unwrap().unwrap();
         wal.append_one(3, b"persisted").unwrap();
     } // drop，模拟进程结束
-    let wal2 = Wal::open(tmp_wal_path(&tmp)).unwrap();
+    let wal2 = Wal::open(tmp_wal_path(&tmp), false).unwrap().unwrap();
     assert!(wal2.has_entries());
     assert_eq!(wal2.get(3).unwrap(), Some(b"persisted".to_vec()));
 }
@@ -68,7 +77,7 @@ fn wal_partial_tail_ignored() {
         f.write_all(&8u32.to_le_bytes()).unwrap();
         f.write_all(b"XYZ").unwrap(); // 只有 3/8 字节
     }
-    let wal = Wal::open(path).unwrap();
+    let wal = Wal::open(path, true).unwrap().unwrap();
     assert_eq!(wal.get(1).unwrap(), Some(b"AAAA".to_vec()));
     assert_eq!(wal.get(2).unwrap(), None, "半截条目应被忽略");
 }
@@ -78,7 +87,7 @@ fn wal_partial_tail_ignored() {
 fn eviction_flushes_dirty_block_to_wal() {
     let cfg = Arc::new(EditorConfig::default());
     let tmp = tempfile::TempDir::new().unwrap();
-    let wal = Wal::open(tmp_wal_path(&tmp)).unwrap();
+    let wal = Wal::open(tmp_wal_path(&tmp), true).unwrap().unwrap();
     let cache = Arc::new(BlockCache::new_for_test(cfg, 1));
     cache.attach_wal(wal.clone());
 
@@ -135,7 +144,8 @@ async fn save_as_merges_wal_content() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), b"AAAAAAAAAA").unwrap();
     let mut ed = make_editor(tmp.path(), 32).await;
-    // 打开后缓存为空（测试不触发 prefetch），直接向 WAL 写块 0 的"编辑后"内容
+    // 惰性 WAL：需先显式启用，才能拿到 WAL 引用写块内容
+    ed.ensure_wal().await.unwrap();
     let wal = ed.cache.wal().unwrap();
     let edited0 = b"XNEWAAAAAAAAA".to_vec(); // 块 0 编辑后（长度变化）
     wal.append_one(0, &edited0).unwrap();
@@ -145,6 +155,46 @@ async fn save_as_merges_wal_content() {
     let got = std::fs::read(&out).unwrap();
     assert_eq!(got, edited0, "save_as 应采用 WAL 中的块内容");
     std::fs::remove_file(&out).ok();
+}
+
+/// 只读/未编辑模式：启动不生成 WAL 临时文件；首次编辑才惰性创建。
+#[tokio::test]
+async fn lazy_wal_no_file_until_first_edit() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), b"AAAAAAAAAA").unwrap();
+    let mut ed = make_editor(tmp.path(), 32).await;
+    let wal_path = tmp.path().with_extension("beditor-wal");
+
+    assert!(ed.cache.wal().is_none(), "未编辑前不应挂接 WAL");
+    assert!(!wal_path.exists(), "未编辑前不应生成 WAL 临时文件");
+
+    ed.goto_byte(2);
+    ed.insert_bytes_at_cursor(b"NEW").await.unwrap();
+    assert!(ed.cache.wal().is_some(), "首次编辑后应挂接 WAL");
+    assert!(wal_path.exists(), "首次编辑后应生成 WAL 临时文件");
+}
+
+/// 完整合并写入基础文件（save_as 折叠到自身）后，WAL 临时文件应被删除。
+/// 折叠到自身仅出现在退出路径，此处额外验证删除后 ensure_wal 可重新启用。
+#[tokio::test]
+async fn fold_save_removes_wal_file() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), b"AAAAAAAAAA").unwrap();
+    let mut ed = make_editor(tmp.path(), 32).await;
+    let wal_path = tmp.path().with_extension("beditor-wal");
+
+    ed.goto_byte(2);
+    ed.insert_bytes_at_cursor(b"NEW").await.unwrap();
+    assert!(wal_path.exists(), "编辑后 WAL 已创建");
+
+    ed.save_as(tmp.path().to_path_buf()).await.unwrap(); // 折叠到自身
+    assert!(!wal_path.exists(), "合并保存后应删除 WAL 临时文件");
+    assert!(!ed.wal_pending(), "折叠后不应有未合并 WAL 增量");
+
+    // 删除后如需继续写会话：ensure_wal 应重新创建临时文件
+    ed.ensure_wal().await.unwrap();
+    assert!(wal_path.exists(), "ensure_wal 应重新创建 WAL 临时文件");
+    assert!(ed.cache.wal().is_some());
 }
 
 /// 崩溃后重开：io_worker 回放 WAL，未保存编辑自动恢复。

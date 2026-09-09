@@ -56,6 +56,16 @@ pub enum IoRequest {
         max_bytes: usize,
         reply: oneshot::Sender<Vec<u8>>,
     },
+    /// 惰性启用 WAL：文件不存在则创建 `<file>.beditor-wal` 并挂到缓存/状态。
+    /// 幂等（已启用则直接成功）。首次编辑或 :rw 切换可写时由 Editor 发出。
+    EnableWal {
+        reply: oneshot::Sender<Result<(), IoError>>,
+    },
+    /// 摘除 WAL；`delete = true` 时删除临时文件（完整合并写入基础文件后清理）。
+    DisposeWal {
+        delete: bool,
+        reply: oneshot::Sender<Result<(), IoError>>,
+    },
 }
 
 #[derive(Debug)]

@@ -148,6 +148,10 @@ impl Editor {
         if self.read_only {
             return Err(EditError::GapBuffer("只读模式，禁止修改".into()));
         }
+        // 首次编辑惰性创建 WAL（脏块淘汰/增量保存需要）
+        self.ensure_wal()
+            .await
+            .map_err(|e| EditError::GapBuffer(format!("WAL 初始化失败: {e}")))?;
         if self.cursor_byte > self.file_size {
             return Err(EditError::OffsetOutOfRange(self.cursor_byte, self.file_size));
         }
@@ -207,6 +211,9 @@ impl Editor {
         if self.read_only {
             return Err(EditError::GapBuffer("只读模式，禁止修改".into()));
         }
+        self.ensure_wal()
+            .await
+            .map_err(|e| EditError::GapBuffer(format!("WAL 初始化失败: {e}")))?;
         if len == 0 {
             return Ok(());
         }
@@ -261,6 +268,9 @@ impl Editor {
         if self.read_only {
             return Err(EditError::GapBuffer("只读模式，禁止修改".into()));
         }
+        self.ensure_wal()
+            .await
+            .map_err(|e| EditError::GapBuffer(format!("WAL 初始化失败: {e}")))?;
         let entry = self.undo_stack.pop().ok_or(EditError::NothingToUndo)?;
         match entry {
             UndoEntry::InsertBytes { block_id, inner_pos, bytes, cursor_before, split } => {
@@ -305,6 +315,9 @@ impl Editor {
         if self.read_only {
             return Err(EditError::GapBuffer("只读模式，禁止修改".into()));
         }
+        self.ensure_wal()
+            .await
+            .map_err(|e| EditError::GapBuffer(format!("WAL 初始化失败: {e}")))?;
         let entry = self.redo_stack.pop().ok_or(EditError::NothingToRedo)?;
         match entry {
             UndoEntry::InsertBytes { block_id, inner_pos, bytes, cursor_before, split } => {
@@ -392,8 +405,8 @@ impl Editor {
     /// ⚠️ 不变量（R1）：基础文件在会话期间**只读**且保持块对齐（block i 位于 i×block_size），
     /// 编辑只写 WAL。本函数是唯一改写基础文件的地方：
     /// - 折叠到【自身路径】会破坏块对齐（写入的是逻辑块的拼接），因此只能在**退出时**
-    ///   调用（:wq / 退出合并），完成后立即清空 WAL，之后进程结束、不再有按物理偏移的读取；
-    ///   下一进程会从新文件重新建立块模型。
+    ///   调用（:wq / 退出合并），完成后立即删除 WAL 临时文件（内容已并入基础文件），
+    ///   之后进程结束、不再有按物理偏移的读取；下一进程会从新文件重新建立块模型。
     /// - 折叠到【其他路径】不动原文件，WAL 保留，编辑仍与原始文件关联。
     ///
     /// 若未来要在会话中途折叠到自身，必须先重建 delta_table/block_count 等块模型，
@@ -446,9 +459,10 @@ impl Editor {
 
         self.file_size = written_bytes;
         self.original_file_size = written_bytes;
-        // 折叠到自身会破坏基础文件块对齐，必须同步清空 WAL（R1 不变量）
+        // 折叠到自身会破坏基础文件块对齐，必须清理 WAL（R1 不变量）。
+        // 内容已全部写入基础文件，临时文件一并删除，不再残留零字节文件。
         if fold_into_self {
-            self.reset_wal()?;
+            self.dispose_wal(true).await?;
             debug_assert!(!self.wal_pending(), "折叠到自身后 WAL 必须清空");
         }
         Ok(())
@@ -474,12 +488,31 @@ impl Editor {
         self.cache.wal().map(|w| w.has_entries()).unwrap_or(false)
     }
 
-    /// 合并完成后清空 WAL（内容已全部写入基础文件）
-    pub fn reset_wal(&self) -> Result<(), IoError> {
-        match self.cache.wal() {
-            Some(w) => w.reset().map_err(|e| IoError::SaveFailed(format!("WAL 重置失败: {e}"))),
-            None => Ok(()),
+    /// 确保 WAL 已启用（惰性创建 `<file>.beditor-wal` 并挂接）。
+    /// 幂等：已启用则直接返回。只读模式不调用（不产生临时文件）。
+    pub async fn ensure_wal(&self) -> Result<(), IoError> {
+        if self.cache.wal().is_some() {
+            return Ok(());
         }
+        let (tx, rx) = oneshot::channel();
+        self.io_tx
+            .send(IoRequest::EnableWal { reply: tx })
+            .await
+            .map_err(|e| IoError::SaveFailed(format!("send EnableWal: {e}")))?;
+        rx.await
+            .map_err(|e| IoError::SaveFailed(format!("EnableWal reply canceled: {e}")))?
+    }
+
+    /// 摘除 WAL；`delete = true` 时删除临时文件。
+    /// 完整合并写入基础文件（save_as 折叠到自身）后调用，清理残留。
+    pub async fn dispose_wal(&self, delete: bool) -> Result<(), IoError> {
+        let (tx, rx) = oneshot::channel();
+        self.io_tx
+            .send(IoRequest::DisposeWal { delete, reply: tx })
+            .await
+            .map_err(|e| IoError::SaveFailed(format!("send DisposeWal: {e}")))?;
+        rx.await
+            .map_err(|e| IoError::SaveFailed(format!("DisposeWal reply canceled: {e}")))?
     }
 
     pub async fn search_literal(

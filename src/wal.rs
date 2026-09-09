@@ -34,15 +34,24 @@ pub struct Wal {
 }
 
 impl Wal {
-    /// 打开/创建 WAL 文件并重建索引（用于崩溃恢复回放）。
+    /// 打开 WAL 文件并重建索引（用于崩溃恢复回放）。
+    ///
+    /// - `create = true`：文件不存在则创建（首次启用 WAL / 首次编辑时惰性创建）。
+    /// - `create = false`：仅当文件已存在时打开（启动时探测崩溃残留），
+    ///   不存在则返回 `Ok(None)`——**不会生成临时文件**（只读模式即如此）。
+    ///
     /// 若文件尾部有半截条目（写入中途崩溃），忽略该半截条目。
-    pub fn open(path: PathBuf) -> std::io::Result<Arc<Wal>> {
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false) // 保留既有条目，供崩溃回放
-            .open(&path)?;
+    pub fn open(path: PathBuf, create: bool) -> std::io::Result<Option<Arc<Wal>>> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(true).truncate(false);
+        if create {
+            opts.create(true);
+        }
+        let mut file = match opts.open(&path) {
+            Ok(f) => f,
+            Err(e) if !create && e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
         let mut index = HashMap::new();
         let mut end: u64 = 0;
         loop {
@@ -64,10 +73,10 @@ impl Wal {
             index.insert(id, WalEntry { offset: end + 8, len: len as u32 });
             end += 8 + len as u64;
         }
-        Ok(Arc::new(Wal {
+        Ok(Some(Arc::new(Wal {
             path,
             inner: Mutex::new(WalInner { file, index, end }),
-        }))
+        })))
     }
 
     /// 追加一批脏块并 fsync。批量写 + 一次 fsync，减少落盘次数。

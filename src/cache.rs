@@ -97,6 +97,11 @@ impl BlockCache {
         *self.wal.lock() = Some(wal);
     }
 
+    /// 摘除 WAL（合并写入基础文件后清理临时文件时调用），返回旧值
+    pub fn detach_wal(&self) -> Option<Arc<Wal>> {
+        self.wal.lock().take()
+    }
+
     /// 当前挂接的 WAL（可能为 None）
     pub fn wal(&self) -> Option<Arc<Wal>> {
         self.wal.lock().clone()

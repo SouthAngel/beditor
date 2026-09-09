@@ -469,8 +469,18 @@ async fn handle_command_result(
                 status.message = Some("已切换为只读".into());
                 status.message_is_error = false;
             } else {
-                status.message = Some("已切换为可写".into());
-                status.message_is_error = false;
+                // 切回可写需要 WAL 支撑增量持久化；惰性创建临时文件
+                match editor.ensure_wal().await {
+                    Ok(()) => {
+                        status.message = Some("已切换为可写".into());
+                        status.message_is_error = false;
+                    }
+                    Err(e) => {
+                        status.message = Some(format!("切换可写失败: {e}"));
+                        status.message_is_error = true;
+                        editor.read_only = true; // 回退，避免无 WAL 时编辑丢数据
+                    }
+                }
             }
         }
         CommandResult::GotoByte(byte) => {

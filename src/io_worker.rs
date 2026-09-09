@@ -1,6 +1,6 @@
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use sysinfo::System;
 use tokio::fs::File;
@@ -47,15 +47,23 @@ pub async fn spawn_io_workers(
     let _main_file = File::open(&file_path).await
         .map_err(|e| IoError::SaveFailed(format!("打开文件失败: {e}")))?;
 
-    // 增量持久化：打开/回放 WAL 并挂到缓存（脏块淘汰时自动写入）
+    // 增量持久化：惰性 WAL。
+    // 启动时仅【探测】已有 WAL（崩溃残留回放）；文件不存在则不创建临时文件，
+    // 从而只读模式/未编辑时不产生 `<file>.beditor-wal`。首次编辑或 :rw 时
+    // 经 IoRequest::EnableWal 创建并挂接。
     let wal_path = file_path.with_extension("beditor-wal");
-    let wal = Wal::open(wal_path)
+    let wal = Wal::open(wal_path.clone(), false)
         .map_err(|e| IoError::SaveFailed(format!("打开 WAL 失败: {e}")))?;
-    if wal.has_entries() {
-        info!(entries = wal.len(), "检测到未合并的 WAL 数据，已回放");
+    if let Some(w) = &wal {
+        if w.has_entries() {
+            info!(entries = w.len(), "检测到未合并的 WAL 数据，已回放");
+        }
+        cache.attach_wal(w.clone());
     }
-    cache.attach_wal(wal.clone());
-    let wal_for_dispatch = wal.clone();
+    // dispatcher 与各子任务共享的 WAL 状态（惰性启用/摘除），std::Mutex 短临界区
+    let wal_state: Arc<Mutex<Option<Arc<Wal>>>> = Arc::new(Mutex::new(wal));
+    let wal_state_for_dispatch = wal_state.clone();
+    let wal_path_for_dispatch = wal_path.clone();
 
     // dispatcher task
     tokio::spawn(async move {
@@ -65,10 +73,10 @@ pub async fn spawn_io_workers(
                     let fp = file_path_for_dispatch.clone();
                     let bs = cfg_for_dispatch.block_size;
                     let c = cache_for_dispatch.clone();
-                    let w = wal_for_dispatch.clone();
+                    let w = wal_state_for_dispatch.lock().unwrap().clone();
                     tokio::spawn(async move {
                         let disk_file_size = std::fs::metadata(&fp).map(|m| m.len()).unwrap_or(0);
-                        let result = logical_block_bytes(&c, Some(&w), None, &fp, block_id, bs, disk_file_size).await;
+                        let result = logical_block_bytes(&c, w.as_deref(), None, &fp, block_id, bs, disk_file_size).await;
                         let _ = reply.send(result);
                     });
                 }
@@ -76,10 +84,10 @@ pub async fn spawn_io_workers(
                     let c = cache_for_dispatch.clone();
                     let fp = file_path_for_dispatch.clone();
                     let bs = cfg_for_dispatch.block_size;
-                    let w = wal_for_dispatch.clone();
+                    let w = wal_state_for_dispatch.lock().unwrap().clone();
                     let ev = event_tx.clone();
                     tokio::spawn(async move {
-                        let loaded = prefetch_impl(&fp, &c, &w, start_block, end_block, bs).await;
+                        let loaded = prefetch_impl(&fp, &c, w.as_deref(), start_block, end_block, bs).await;
                         let _ = ev.send(IoEvent::PrefetchCompleted {
                             range: start_block..end_block,
                             loaded,
@@ -94,18 +102,21 @@ pub async fn spawn_io_workers(
                     });
                 }
                 IoRequest::FlushBlock { block_id, data, reply } => {
-                    let w = wal_for_dispatch.clone();
+                    let w = wal_state_for_dispatch.lock().unwrap().clone();
                     tokio::spawn(async move {
-                        let result = w.append_one(block_id, &data)
-                            .map_err(|e| IoError::SaveFailed(format!("WAL 追加失败: {e}")));
+                        let result = match w {
+                            Some(w) => w.append_one(block_id, &data)
+                                .map_err(|e| IoError::SaveFailed(format!("WAL 追加失败: {e}"))),
+                            None => Err(IoError::SaveFailed("WAL 未启用".into())),
+                        };
                         let _ = reply.send(result);
                     });
                 }
                 IoRequest::CommitSave { reply } => {
                     let c = cache_for_dispatch.clone();
-                    let w = wal_for_dispatch.clone();
+                    let w = wal_state_for_dispatch.lock().unwrap().clone();
                     tokio::spawn(async move {
-                        let result = commit_save_impl(&c, &w).await;
+                        let result = commit_save_impl(&c, w.as_deref()).await;
                         let _ = reply.send(result);
                     });
                 }
@@ -113,9 +124,9 @@ pub async fn spawn_io_workers(
                     let fp = file_path_for_dispatch.clone();
                     let bs = cfg_for_dispatch.block_size;
                     let c = cache_for_dispatch.clone();
-                    let w = wal_for_dispatch.clone();
+                    let w = wal_state_for_dispatch.lock().unwrap().clone();
                     tokio::spawn(async move {
-                        let result = search_impl(&fp, &c, &w, SearchArgs {
+                        let result = search_impl(&fp, &c, w.as_deref(), SearchArgs {
                             query,
                             start_byte,
                             start_block,
@@ -125,6 +136,24 @@ pub async fn spawn_io_workers(
                             direction,
                             limit,
                         }).await;
+                        let _ = reply.send(result);
+                    });
+                }
+                IoRequest::EnableWal { reply } => {
+                    let c = cache_for_dispatch.clone();
+                    let st = wal_state_for_dispatch.clone();
+                    let p = wal_path_for_dispatch.clone();
+                    tokio::spawn(async move {
+                        let result = enable_wal_impl(&c, &st, &p);
+                        let _ = reply.send(result);
+                    });
+                }
+                IoRequest::DisposeWal { delete, reply } => {
+                    let c = cache_for_dispatch.clone();
+                    let st = wal_state_for_dispatch.clone();
+                    let p = wal_path_for_dispatch.clone();
+                    tokio::spawn(async move {
+                        let result = dispose_wal_impl(&c, &st, delete, &p);
                         let _ = reply.send(result);
                     });
                 }
@@ -220,7 +249,10 @@ pub async fn logical_block_bytes(
 
 /// CommitSave（:w 增量保存）：把所有脏块写入 WAL 并 fsync，不改动基础文件。
 /// 返回写入报告；成功后这些块在缓存中标记为 Clean（内容已持久化）。
-async fn commit_save_impl(cache: &BlockCache, wal: &Wal) -> Result<SaveReport, IoError> {
+///
+/// `wal` 可能为 None（惰性 WAL 未创建）：无脏块时视为空保存；有脏块则报错
+/// （正常流程不会出现——首次编辑已通过 ensure_wal 启用 WAL）。
+async fn commit_save_impl(cache: &BlockCache, wal: Option<&Wal>) -> Result<SaveReport, IoError> {
     let t0 = Instant::now();
     let dirty = cache.dirty_ids();
     let mut entries: Vec<(BlockId, Vec<u8>)> = Vec::new();
@@ -231,8 +263,12 @@ async fn commit_save_impl(cache: &BlockCache, wal: &Wal) -> Result<SaveReport, I
             entries.push((id, bytes));
         }
     }
-    wal.append_many(&entries)
-        .map_err(|e| IoError::SaveFailed(format!("WAL 追加失败: {e}")))?;
+    match wal {
+        Some(w) => w.append_many(&entries)
+            .map_err(|e| IoError::SaveFailed(format!("WAL 追加失败: {e}")))?,
+        None if !entries.is_empty() => return Err(IoError::SaveFailed("WAL 未启用，无法增量保存".into())),
+        None => {}
+    }
     Ok(SaveReport {
         written_bytes: written,
         dirty_blocks_written: entries.len(),
@@ -241,10 +277,49 @@ async fn commit_save_impl(cache: &BlockCache, wal: &Wal) -> Result<SaveReport, I
     })
 }
 
+/// 惰性启用 WAL：文件不存在则创建 `<file>.beditor-wal` 并挂到缓存/状态。
+/// 幂等——已启用时直接成功（避免首次编辑后的重复创建）。
+fn enable_wal_impl(
+    cache: &BlockCache,
+    state: &Mutex<Option<Arc<Wal>>>,
+    path: &Path,
+) -> Result<(), IoError> {
+    if cache.wal().is_some() {
+        return Ok(());
+    }
+    let wal = Wal::open(path.to_path_buf(), true)
+        .map_err(|e| IoError::SaveFailed(format!("创建 WAL 失败: {e}")))?
+        .expect("create=true 必然返回 Some");
+    cache.attach_wal(wal.clone());
+    *state.lock().unwrap() = Some(wal);
+    info!(path = %path.display(), "WAL 已惰性启用");
+    Ok(())
+}
+
+/// 摘除 WAL 并可选删除临时文件（完整合并写入基础文件后清理）。
+/// 摘除后下次编辑会经 EnableWal 重新创建，实现"临时文件随会话状态存在"。
+fn dispose_wal_impl(
+    cache: &BlockCache,
+    state: &Mutex<Option<Arc<Wal>>>,
+    delete: bool,
+    path: &Path,
+) -> Result<(), IoError> {
+    cache.detach_wal();
+    *state.lock().unwrap() = None;
+    if delete {
+        match std::fs::remove_file(path) {
+            Ok(_) => debug!(path = %path.display(), "WAL 临时文件已移除"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(IoError::SaveFailed(format!("删除 WAL 临时文件失败: {e}"))),
+        }
+    }
+    Ok(())
+}
+
 async fn prefetch_impl(
     file_path: &Path,
     cache: &Arc<BlockCache>,
-    wal: &Wal,
+    wal: Option<&Wal>,
     start: BlockId,
     end: BlockId,
     block_size: usize,
@@ -255,7 +330,7 @@ async fn prefetch_impl(
     let mut loaded = 0;
     for id in start..end_exclusive {
         if cache.try_get(id).is_some() { continue; }
-        match logical_block_bytes(cache, Some(wal), None, file_path, id, block_size, file_size).await {
+        match logical_block_bytes(cache, wal, None, file_path, id, block_size, file_size).await {
             Ok(bytes) => {
                 let block = crate::block::Block::new_clean(id, bytes);
                 cache.insert_loaded(block);
@@ -306,7 +381,7 @@ struct SearchArgs {
 async fn search_impl(
     file_path: &Path,
     cache: &BlockCache,
-    wal: &Wal,
+    wal: Option<&Wal>,
     args: SearchArgs,
 ) -> SearchResult {
     if args.query.is_empty() || args.limit == 0 || args.logical_block_count == 0 {
@@ -330,7 +405,7 @@ async fn search_impl(
 
             for block_id in start_block..args.logical_block_count {
                 scanned += 1;
-                let content = logical_block_bytes(cache, Some(wal), None, file_path, block_id, args.block_size, disk_file_size).await.unwrap_or_default();
+                let content = logical_block_bytes(cache, wal, None, file_path, block_id, args.block_size, disk_file_size).await.unwrap_or_default();
 
                 let overlap_size = prev_overlap.len();
                 let mut search_buf: Vec<u8> = Vec::with_capacity(overlap_size + content.len());
@@ -382,7 +457,7 @@ async fn search_impl(
 
             for block_id in (0..=start_block).rev() {
                 scanned += 1;
-                let content = logical_block_bytes(cache, Some(wal), None, file_path, block_id, args.block_size, disk_file_size).await.unwrap_or_default();
+                let content = logical_block_bytes(cache, wal, None, file_path, block_id, args.block_size, disk_file_size).await.unwrap_or_default();
                 let content_len = content.len() as u64;
                 if first {
                     end = args.start_block_offset + content_len;
